@@ -5,24 +5,24 @@
 
 **图 1**  openGauss + MCP + LLM 架构
 <div style="display:flex;justfy-content:center;">  
-    <img src="MCP.png" height=600px style="width: 750;height: 600;">
+    <img src="pics/MCP.png" height=600px style="width: 750;height: 600;">
 </div>
 
 ## 快速搭建openGauss + MCP + LLM的AI Agent应用
 ### 环境准备
 - 安装python3环境，安装uv。
-- 通过容器部署并启动[openGauss数据库](https://docs.opengauss.org/zh/docs/latest/docs/InstallationGuide/InstallationGuide.html)。(openGauss官网：学习->文档->最新开发版本->安装指南->容器镜像安装）
+- 部署并启动[openGauss数据库](https://docs.opengauss.org/zh/docs/latest/docs/InstallationGuide/InstallationGuide.html)。可以通过容器安装在PC启动openGauss数据库(openGauss官网：学习->文档->最新开发版本->安装指南->容器镜像安装）
 - 下载Claude Desktop配合MCP协议进行问答操作。
 
 ### 获取openGauss_mcp_server源码
 访问链接, 获取[openGauss_mcp_server源码](https://gitcode.com/opengauss/mcp-opengauss)，当前版本为（0.1.0）。
 
 ### 配置参数
-- 打开Claude Desktop设置，编辑配置文件。
+- 打开Claude Desktop设置，编辑配置文件, 设置mcp server启动路径（/src/openGauss_mcp_server)
 
 **图 2**  Claude Desktop配置页面
 <div style="display:flex;justfy-content:center;">
-    <img src="Claude.png" style>
+    <img src="pics/Claude.png" style>
 </div>
 
 - 通过Edit Config增加配置
@@ -55,11 +55,11 @@
 
 **图 3**  Claude Desktop可用MCP Tool
 <div style="display:flex;justfy-content:center;">
-    <img src="Claude-MCP.png" height=600px style="width: 750;height: 600;">
+    <img src="pics/Claude-MCP.png" height=600px style="width: 750;height: 600;">
 </div>
 
 ### 使用Cluade Desktop通过openGauss进行问答
 **图 4**  Claude Desktop问答演示
 <div style="display:flex;justfy-content:center;">
-    <img src="Claude-show.png" height=600px style="width: 750;height: 600;">
+    <img src="pics/Claude-show.png" height=600px style="width: 750;height: 600;">
 </div>
