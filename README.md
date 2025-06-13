@@ -1,2 +1,2 @@
-# mcp-opengauss
+# openGauss MCP
 
