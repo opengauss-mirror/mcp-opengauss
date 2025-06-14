@@ -5,9 +5,10 @@ openGauss是一款开源关系型数据库管理系统，采用木兰宽松许�
 
 本仓库提供如下MCP Server:
 
-| MCP Server           | 描述                                                   | 使用文档                                |
-| -------------------- | ------------------------------------------------------ | --------------------------------------- |
-| openGauss MCP Server | 可以和openGauss数据库安全交互的MCP Server，支持执行SQL语句   | [Doc](docs/openGauss_mcp_server.md)   |
+| MCP Server           | 描述                                       | 使用文档                                |
+|----------------------|------------------------------------------| --------------------------------------- |
+| openGauss MCP Server | 可以和openGauss数据库安全交互的MCP Server，支持执行SQL语句 | [Doc](docs/openGauss_mcp_server.md)   |
+| DataKit MCP Server   | 实现了MySQL数据库到openGauss数据库的智能全自动数据迁移能力     | [Doc](docs/datakit_mcp_server.md)   |
 
 
 ## 社区
