@@ -24,7 +24,9 @@ def openGauss_connection():
                 CREATE TABLE IF NOT EXISTS test_table (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     name VARCHAR(255),
-                    value INT
+                    value INT,
+                    embedding vector(5),
+                    context text
                 )
             """)
             connection.commit()

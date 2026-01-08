@@ -20,12 +20,26 @@
 ### 配置参数
 - 打开Claude Desktop设置，编辑配置文件, 设置mcp server启动路径（/src/openGauss_mcp_server)
 
+    环境变量：
+    | 名称 | 描述 |
+    |-------|-------|
+    |OPENGAUSS_HOST|openGauss数据库host|
+    |OPENGAUSS_PORT|openGauss数据库端口号|
+    |OPENGAUSS_USER|openGauss用户名|
+    |OPENGAUSS_PASSWORD|openGauss数据库连接密码|
+    |OPENGAUSS_DBNAME|openGauss数据库名称|
+    |ENABLE_MEMORY|记忆系统开关，1表示开启，0表示关闭|
+    |EMBEDDING_MODEL_PROVIDER| 模型提供商，默认huggingface|
+    |LOCAL_MODEL_DIR|本地嵌入模型路径|
+    |REMOTE_MODEL_NAME|远程嵌入模型名称，默认BAAI/bge-small-en-v1.5|
+
 **图 2**  Claude Desktop配置页面
 <div style="display:flex;justfy-content:center;">
     <img src="pics/Claude.png" style>
 </div>
 
-- 通过Edit Config增加配置
+- Stdio模式 <br>
+在支持MCP的客户端中，将下面内容填入配置文件，比如在Claude Desktop中可以通过Edit Config增加配置
 
 ```
 {
@@ -43,12 +57,47 @@
                 "OPENGAUSS_PORT": "8888",
                 "OPENGAUSS_USER": "your_username",
                 "OPENGAUSS_PASSWORD": "your_password",
-                "OPENGAUSS_DBNAME": "your_database"
+                "OPENGAUSS_DBNAME": "your_database",
+                "ENABLE_MEMORY": "0"
             }
         }
     }
 }
 ```
+
+- SSE模式<br>
+在SSE模式下，允许多个MCP客户端共享一台服务器，可能是远程服务器。在启动MCP服务前请先配置好相关的环境变量。
+```
+cd src/openGauss_mcp_server
+python3 -m server --transport sse --sse_port <yourport> --sse_host 0.0.0.0
+```
+
+MCP服务启动后就可以更新MCP客户端的配置：
+```
+{
+  "mcpServers": {
+    "openGauss":{
+      "type":"sse",
+      "url":"http://<yourip>:<yourport>/sse"
+        }
+  }
+}
+```
+
+## openGauss MCP工具
+- 执行SQL语句
+- 查询数据库中所有表格
+- 查询表格部分内容
+- 查询SQL语句的执行计划
+- 创建BM25全文索引
+- 带标量的全文搜索
+- 创建向量索引
+- 带标量的向量搜索
+- 通过全文、向量、标量进行混合搜索
+- 查询openGauss官网文档
+- 用户记忆系统
+
+
 ## AI服务集成
 ### 重新启动Claude Desktop
 可以看到可用MCP Tool, 执行sql通过openGauss server
@@ -63,3 +112,49 @@
 <div style="display:flex;justfy-content:center;">
     <img src="pics/Claude-show.png" height=600px style="width: 750;height: 600;">
 </div>
+
+### 示例
+问题一：查看数据库的所有表格
+```sql
+tablename,tableowner,schemaname
+documents,test2,public
+og_mcp_memory,test2,public
+test_vectors_5d,test2,public
+```
+
+问题二：混合搜索（全文+向量+标量）<br>
+对表格test_vectors_5d进行混合搜索，要求全文搜索的权重是0.7，返回参数不需要返回向量列
+```json
+{
+  "id": 1,
+  "title": "Document A",
+  "description": "First test document",
+  "score": 0.0870114043354988,
+  "bm25_norm": 1.0,
+  "vector_norm": 1.0,
+  "hybrid_score": 1.0
+}
+
+{
+  "id": 3,
+  "title": "Document C",
+  "description": "Third test document",
+  "score": 0.0870114043354988,
+  "bm25_norm": 1.0,
+  "vector_norm": 0.9974683567754559,
+  "hybrid_score": 0.9992405070326367
+}
+```
+
+问题三：用户记忆系统 <br>
+1）我喜欢吃火锅，平时住在杭州
+```
+AI：用户提供了个人偏好信息（喜欢吃火锅，住在杭州），这应该被存储到个人记忆系统中。我需要使用og_memory_insert工具来存储这些信息。
+...
+```
+
+2）推荐好喝的饮料
+```
+AI：让我先使用og_memory_query工具来查询用户的饮料偏好信息。
+...
+```
