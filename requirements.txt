@@ -4,3 +4,8 @@ pytest-cov>=4.1.0
 black>=23.0.0
 isort>=5.12.0
 mypy>=1.0.0
+psycopg2
+mcp
+beautifulsoup4
+sentence-transformers>=5.2.2
+langchain_huggingface>=1.2.0
