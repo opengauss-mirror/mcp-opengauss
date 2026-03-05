@@ -25,7 +25,7 @@ logger = logging.getLogger("openGauss_mcp_server")
 def get_db_config():
     """Get database configuration from environment variables."""
     config = {
-        "host": os.getenv("", "localhost"),
+        "host": os.getenv("OPENGAUSS_HOST", "localhost"),
         "port": int(os.getenv("OPENGAUSS_PORT", "5432")), 
         "user": os.getenv("OPENGAUSS_USER"),
         "password": os.getenv("OPENGAUSS_PASSWORD"),
@@ -408,7 +408,7 @@ async def search_opengauss_document(keyword: str):
     1.Information Retrieval: The MCP Tool searches through OpenGauss-related documentation using the extracted keywords, locating and extracting the most relevant information.
     2.Context Provision: The retrieved information from OpenGauss documentation is then fed back to the LLM as contextual reference material. This context is not directly shown to the user but is used to refine and inform the LLM’s responses.
     This tool ensures that when the LLM’s internal documentation is insufficient to generate high-quality responses, it dynamically retrieves necessary OpenGauss information, thereby maintaining a high level of response accuracy and expertise.
-    Important: keyword must be Chinese
+    Keywords can now include both English and Chinese.
     """
     logger.info(f"Calling tool: search_opengauss_document,keyword:{keyword}")
     search_api_url = (
@@ -425,7 +425,7 @@ async def search_opengauss_document(keyword: str):
     query_param = {
         "keyword": keyword,
         "page": 1,
-        "size": 5,
+        "pageSize": 5,
         "lang": "zh",
         "version": "latest",
     }
@@ -436,7 +436,7 @@ async def search_opengauss_document(keyword: str):
     context = ssl.create_default_context()
     try:
         with request.urlopen(req, timeout=5, context=context) as response:
-            response_body = response.read().decode("utf-8")
+            response_body = response.read().decode("utf-8", errors="replace")
             json_data = json.loads(response_body)
 
             records = json_data.get("obj", {}).get("records", [])
@@ -463,11 +463,28 @@ def get_opengauss_doc_content(doc_url: str) -> dict:
         "Referer": "https://docs.opengauss.org",
     }
 
+    try:
+        ascii_url = doc_url.encode('ascii').decode('ascii')
+    except UnicodeEncodeError:
+        from urllib.parse import quote
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(doc_url)
+        encoded_path = quote(parsed.path, safe='')
+        encoded_url = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            encoded_path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment
+        ))
+        doc_url = encoded_url
+
     req = request.Request(doc_url, headers=headers, method="GET")
     context = ssl.create_default_context()
     try:
         with request.urlopen(req, timeout=5, context=context) as response:
-            html = response.read().decode("utf-8")
+            html = response.read().decode("utf-8", errors="replace")
             soup = BeautifulSoup(html, "html.parser")
 
             for element in soup(["script", "style", "nav", "header", "footer"]):
@@ -482,7 +499,15 @@ def get_opengauss_doc_content(doc_url: str) -> dict:
             if len(text) > 8000:
                 text = text[:8000] + "... [content truncated]"
 
-            title = soup.title.string if soup.title else "openGauss 文档"
+            title = soup.title.string if (soup.title and soup.title.string) else "openGauss 文档"
+            
+            if not isinstance(title, str):
+                title = str(title)
+            if not isinstance(doc_url, str):
+                doc_url = str(doc_url)
+            if not isinstance(text, str):
+                text = str(text)
+              
             final_result = {
                 "title": title,
                 "url": doc_url,
