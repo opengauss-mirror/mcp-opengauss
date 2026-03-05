@@ -42,7 +42,7 @@ def test_server_initialization():
 async def test_list_tools():
     """Test that list_tools returns expected tools."""
     tools = await list_tools()
-    assert len(tools) == 1
+    assert len(tools) == 4
     assert tools[0].name == "execute_sql"
     assert "query" in tools[0].inputSchema["properties"]
 
