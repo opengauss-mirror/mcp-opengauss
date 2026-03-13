@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import getpass
 import json
 import logging
 import os
@@ -22,17 +23,64 @@ logging.basicConfig(
 )
 logger = logging.getLogger("openGauss_mcp_server")
 
+class SecureCredentialCache:
+    _instance = None
+    _db_password: Optional[str] = None
+    _ssl_keyfile_password: Optional[str] = None
+    _initialized: bool = False
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def get_db_password(self) -> str:
+        if self._db_password is None:
+            env_password = os.getenv("OPENGAUSS_PASSWORD")
+            if env_password:
+                self._db_password = env_password
+                logger.info("Database password loaded from environment variable")
+            else:
+                self._db_password = getpass.getpass("Enter database password: ")
+                logger.info("Database password obtained from interactive input")
+        return self._db_password
+    
+    def get_ssl_keyfile_password(self) -> Optional[str]:
+        if self._ssl_keyfile_password is None:
+            env_ssl_password = os.getenv("SSL_KEYFILE_PASSWORD")
+            if env_ssl_password:
+                self._ssl_keyfile_password = env_ssl_password
+                logger.info("SSL keyfile password loaded from environment variable")
+            else:
+                enable_https = os.getenv("ENABLE_HTTPS", "false").lower() in ("true", "1", "yes", "on")
+                ssl_keyfile = os.getenv("SSL_KEYFILE")
+                ssl_certfile = os.getenv("SSL_CERTFILE")
+                if enable_https and ssl_keyfile and ssl_certfile:
+                    self._ssl_keyfile_password = getpass.getpass("Enter SSL private key password (press Enter if none): ")
+                    if self._ssl_keyfile_password == "":
+                        self._ssl_keyfile_password = None
+                    logger.info("SSL keyfile password obtained from interactive input")
+        return self._ssl_keyfile_password
+    
+    def clear_cache(self):
+        self._db_password = None
+        self._ssl_keyfile_password = None
+        self._initialized = False
+        logger.info("Credential cache cleared")
+
+credential_cache = SecureCredentialCache()
+
 def get_db_config():
     """Get database configuration from environment variables."""
     config = {
         "host": os.getenv("OPENGAUSS_HOST", "localhost"),
         "port": int(os.getenv("OPENGAUSS_PORT", "5432")), 
         "user": os.getenv("OPENGAUSS_USER"),
-        "password": os.getenv("OPENGAUSS_PASSWORD"),
+        "password": credential_cache.get_db_password(),
         "dbname": os.getenv("OPENGAUSS_DBNAME"),
     }
-    if not all([config["user"], config["password"], config["dbname"]]):
-        raise ValueError("Missing required database configuration")
+    if not all([config["user"], config["dbname"]]):
+        raise ValueError("Missing required database configuration (OPENGAUSS_USER, OPENGAUSS_DBNAME)")
     
     return config
 
@@ -134,7 +182,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="hybrid_search",
-            description="Hybrid search: Fusion query combining BM25 full-text search, vector search, and scalar retrieval",
+            description="Hybrid search combining BM25 full-text search, vector similarity search, and scalar filtering. Performs weighted fusion of text and vector search results for more accurate and comprehensive search results. Steps: 1) Full-text search with BM25 scoring, 2) Vector similarity search, 3) Weighted fusion and ranking. Note: hybrid_score, vector_norm, bm25_norm are computed fields, not database columns.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -224,7 +272,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="multi_vector_search",
-            description="Perform vector similarity search with multiple query vectors",
+            description="Perform concurrent vector similarity search with multiple query vectors. Optimizes performance by processing multiple vector queries in parallel using database connection pooling. Ideal for batch vector search operations and multi-vector database lookups. Returns combined results from all query vectors with configurable parallelism.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -304,6 +352,103 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["table_name", "vectors", "vector_field"],
                 "title": "multi_vector_searchArguments"
+            }
+        ),
+        Tool(
+            name="create_vector_index",
+            description="Create a vector index on a specified table and column for efficient vector similarity search. Supports HNSW and other index types with customizable distance metrics.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_name": {
+                        "title": "Table Name",
+                        "type": "string",
+                        "description": "The name of the table on which to create the vector index"
+                    },
+                    "column_name": {
+                        "title": "Column Name",
+                        "type": "string",
+                        "description": "The name of the vector column to index"
+                    },
+                    "index_type": {
+                        "title": "Index Type",
+                        "type": "string",
+                        "default": "hnsw",
+                        "description": "The type of vector index to create (e.g., 'hnsw', 'ivfflat', 'diskann')"
+                    },
+                    "distance_ops": {
+                        "title": "Distance Operations",
+                        "type": "string",
+                        "default": "vector_cosine_ops",
+                        "description": "The distance metric operator (e.g., 'vector_cosine_ops', 'vector_l2_ops', 'vector_ip_ops', 'vector_l1_ops')"
+                    },
+                    "options": {
+                        "title": "Index Options",
+                        "type": "object",
+                        "default": None,
+                        "description": "Additional index options as key-value pairs (e.g., {'M': 16, 'ef_construction': 64} for HNSW)",
+                        "additionalProperties": True
+                    }
+                },
+                "required": ["table_name", "column_name"],
+                "title": "create_vector_indexArguments"
+            }
+        ),
+        Tool(
+            name="vector_search",
+            description="Perform vector similarity search on an OpenGauss table to find the most similar vectors to a query vector. Supports different distance metrics and filtering conditions.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "table_name": {
+                        "title": "Table Name",
+                        "type": "string",
+                        "description": "The name of the table to search"
+                    },
+                    "vector_data": {
+                        "title": "Vector Data",
+                        "type": "string",
+                        "description": "The query vector data (JSON string format)"
+                    },
+                    "vec_column_name": {
+                        "title": "Vector Column Name",
+                        "type": "string",
+                        "default": "vector",
+                        "description": "The name of the column containing vectors to search"
+                    },
+                    "distance_func": {
+                        "title": "Distance Function",
+                        "type": "string",
+                        "default": "cosine",
+                        "description": "The distance algorithm to use: 'cosine' (cosine distance), 'l2' (Euclidean distance), or 'ip' (inner product)"
+                    },
+                    "other_where_clause": {
+                        "title": "Other Where Clause",
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "default": None,
+                        "description": "Additional WHERE clause conditions for filtering results"
+                    },
+                    "topk": {
+                        "title": "Top K",
+                        "type": "integer",
+                        "default": 5,
+                        "description": "Number of top similar results to return"
+                    },
+                    "output_column_name": {
+                        "title": "Output Column Name",
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "default": None,
+                        "description": "List of column names to include in the output. If None, returns all columns"
+                    }
+                },
+                "required": ["table_name", "vector_data"],
+                "title": "vector_searchArguments"
             }
         )
     ]
@@ -507,7 +652,7 @@ def get_opengauss_doc_content(doc_url: str) -> dict:
                 doc_url = str(doc_url)
             if not isinstance(text, str):
                 text = str(text)
-              
+                
             final_result = {
                 "title": title,
                 "url": doc_url,
@@ -1721,24 +1866,82 @@ async def main():
     parser.add_argument(
         "--transport",
         type=str,
-        choices=["stdio", "sse"],
+        choices=["stdio", "sse", "streamable-http"],
         default="stdio",
-        help="Specify the MCP server transport type as stdio or sse.",
+        help="Specify the MCP server transport type as stdio(default) or sse, streamable-http.",
     )
     parser.add_argument("--sse_host", default="127.0.0.1", help="Host to bind to")
     parser.add_argument("--sse_port", type=int, default=8000, help="Port to listen on")
+    parser.add_argument("--streamable_http_host", default="127.0.0.1", help="Host to bind streamable http server to")
+    parser.add_argument("--streamable_http_port", type=int, default=8000, help="Port for streamable http server")
+    # HTTPS/SSL parameters
+    parser.add_argument("--ssl_keyfile", type=str, default=None, help="SSL private key file path for HTTPS")
+    parser.add_argument("--ssl_certfile", type=str, default=None, help="SSL certificate file path for HTTPS")
+    parser.add_argument("--ssl_ca_certs", type=str, default=None, help="SSL CA certificate file path")
     args = parser.parse_args()
     transport = args.transport
     logger.info(f"Starting openGauss MCP server with {transport} mode...")
+    
+    # Check HTTPS enablement from environment variable
+    enable_https = os.getenv("ENABLE_HTTPS", "false").lower() in ("true", "1", "yes", "on")
 
     # Run the server with the selected transport (always async)
     if args.transport == "stdio":
         await app.run_stdio_async()
-    else:
+    elif args.transport == "sse":
         # Update FastMCP settings based on command line arguments
         app.settings.host = args.sse_host
         app.settings.port = args.sse_port
-        await app.run_sse_async()
+        
+        # Directly use uvicorn to run the app with SSL support
+        import uvicorn
+        
+        # Extract SSL parameters
+        ssl_kwargs = {}
+        
+        # Check if HTTPS should be enabled
+        if enable_https or (args.ssl_keyfile and args.ssl_certfile):
+            # Priority: command line arguments first, then environment variables
+            ssl_keyfile = args.ssl_keyfile or os.getenv("SSL_KEYFILE")
+            ssl_certfile = args.ssl_certfile or os.getenv("SSL_CERTFILE")
+            
+            if ssl_keyfile and ssl_certfile:
+                ssl_kwargs['ssl_keyfile'] = ssl_keyfile
+                ssl_kwargs['ssl_certfile'] = ssl_certfile
+                
+                # Password and CA certs from command line or environment
+                ssl_keyfile_password = credential_cache.get_ssl_keyfile_password()
+                if ssl_keyfile_password:
+                    ssl_kwargs['ssl_keyfile_password'] = ssl_keyfile_password
+                
+                ssl_ca_certs = args.ssl_ca_certs or os.getenv("SSL_CA_CERTS")
+                if ssl_ca_certs:
+                    ssl_kwargs['ssl_ca_certs'] = ssl_ca_certs
+                
+                logger.info("HTTPS/SSL enabled")
+            else:
+                logger.warning("HTTPS/SSL enabled but missing required certificate files")
+                logger.warning("Please provide both --ssl_keyfile and --ssl_certfile or set SSL_KEYFILE and SSL_CERTFILE environment variables")
+        
+        # Create Starlette app
+        starlette_app = app.sse_app()
+        
+        # Configure uvicorn
+        config = uvicorn.Config(
+            starlette_app,
+            host=args.sse_host,
+            port=args.sse_port,
+            log_level=app.settings.log_level.lower(),
+            **ssl_kwargs
+        )
+        
+        # Run the server
+        server = uvicorn.Server(config)
+        await server.serve()
+    elif args.transport == "streamable-http":
+        app.settings.host = args.streamable_http_host
+        app.settings.port = args.streamable_http_port
+        await app.run_streamable_http_async()
 
 if __name__ == "__main__":
     asyncio.run(main())

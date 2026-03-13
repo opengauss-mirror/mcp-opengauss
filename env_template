@@ -1,0 +1,78 @@
+# MCP OpenGauss Server 环境变量配置模板
+# 使用方法：复制此文件为 .env，然后修改相应配置
+
+# ==================== 数据库连接配置 ====================
+# openGauss 数据库主机地址
+export OPENGAUSS_HOST="localhost"
+
+# openGauss 数据库端口号
+export OPENGAUSS_PORT=your_port
+
+# openGauss 数据库用户名
+export OPENGAUSS_USER="your_username"
+
+# openGauss 数据库密码
+export OPENGAUSS_PASSWORD="your_password"
+
+# openGauss 数据库名称
+export OPENGAUSS_DBNAME="your_database"
+
+# ==================== 记忆系统配置 ====================
+# 是否启用记忆系统 (1=启用, 0=禁用)
+export ENABLE_MEMORY="1"
+
+# 嵌入模型提供商 (暂时只支持huggingface)
+export EMBEDDING_MODEL_PROVIDER="huggingface"
+
+# 本地嵌入模型路径
+export LOCAL_MODEL_DIR=""
+
+# 远程嵌入模型名称
+export REMOTE_MODEL_NAME="BAAI/bge-small-en-v1.5"
+
+# ==================== HTTPS/SSL 配置 ====================
+# 是否启用HTTPS (true/false, 1/0, yes/no, on/off)
+export ENABLE_HTTPS="true"
+
+# SSL私钥文件路径
+export SSL_KEYFILE="certs/server.key"
+
+# SSL证书文件路径
+export SSL_CERTFILE="certs/server.crt"
+
+# SSL私钥密码 (如果有)
+export SSL_KEYFILE_PASSWORD=""
+
+# SSL CA证书路径
+export SSL_CA_CERTS=""
+
+# ==================== 服务器网络配置 ====================
+# 服务器监听主机 (0.0.0.0 表示监听所有接口)
+export MCP_SERVER_HOST="0.0.0.0"
+
+# SSE模式端口 (HTTPS使用)
+export MCP_SSE_PORT=12000
+
+# ==================== 使用示例 ====================
+# 1. 仅HTTP模式：
+#    export ENABLE_HTTPS="false"
+#
+# 2. 仅HTTPS模式：
+#    export ENABLE_HTTPS="true"
+#    export SSL_KEYFILE="certs/server.key"
+#    export SSL_CERTFILE="certs/server.crt"
+#    export MCP_SSE_PORT=12000
+#
+# 3. 使用环境变量启动服务器：
+#    source .env && python3 -m src.openGauss_mcp_server.server --transport sse --sse_port $MCP_SSE_PORT --sse_host $MCP_SERVER_HOST --ssl_keyfile $SSL_KEYFILE --ssl_certfile $SSL_CERTFILE
+
+# ==================== 快速启动命令 ====================
+# 1. 加载环境变量：source .env
+# 2. 启动服务器：
+#    python3 -m src.openGauss_mcp_server.server --transport sse \
+#        --sse_host $MCP_SERVER_HOST \
+#        --sse_port $MCP_SSE_PORT \
+#        --ssl_keyfile $SSL_KEYFILE \
+#        --ssl_certfile $SSL_CERTFILE \
+#        --ssl_keyfile_password "$SSL_KEYFILE_PASSWORD" \
+#        --ssl_ca_certs "$SSL_CA_CERTS"
