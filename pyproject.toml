@@ -27,3 +27,36 @@ packages = [
 
 [project.scripts]
 openGauss_mcp_server = "openGauss_mcp_server:main"
+
+# ==== 以下为 pre-commit 工具链配置（仅作用于外层 Python，Java 子项目已在 .pre-commit-config.yaml 排除）====
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# 保险起见 ruff 也排除 Java 子项目（虽然它不含 .py，防御性配置）
+extend-exclude = ["src/datakit_mcp_server"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# 存量债务集中屏蔽入口，不必改老代码行。示例：
+# "src/openGauss_mcp_server/server.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+exclude = "^(tests/|src/datakit_mcp_server/)"
+
+[tool.bandit]
+exclude_dirs = ["tests", "src/datakit_mcp_server"]
