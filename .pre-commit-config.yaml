@@ -1,0 +1,65 @@
+# pre-commit 配置（mcp-opengauss / 外层 Python + 内含 Java 子项目）
+#
+# 重要：本仓 src/datakit_mcp_server/ 是独立的 Java(Spring Boot) 子项目，
+#       按约定【不纳入】本 pre-commit 检查。用顶层 exclude 统一排除，
+#       所有 hook 都不会触碰该目录。
+#
+# 其余同 oGMemory：格式化(darker)行级，其余改动文件级；gitcode 镜像；mypy 走 local。
+#
+# 首次启用：
+#   pip install pre-commit mypy
+#   pre-commit install
+
+default_language_version:
+  python: python3
+
+# 全局排除 Java 子项目（及常见非源码目录）。这是本仓与其它两仓的关键差异。
+exclude: '^src/datakit_mcp_server/'
+
+repos:
+  - repo: https://gitcode.com/gh_mirrors/pr/pre-commit-hooks.git
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: check-added-large-files
+      - id: detect-private-key
+
+  - repo: https://gitcode.com/gh_mirrors/co/codespell.git
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+
+  - repo: https://gitcode.com/gh_mirrors/ru/ruff-pre-commit.git
+    rev: v0.15.20
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+
+  - repo: https://gitcode.com/gh_mirrors/ba/bandit.git
+    rev: "1.9.4"
+    hooks:
+      - id: bandit
+        args: ["-c", "pyproject.toml"]
+        additional_dependencies: ["bandit[toml]"]
+
+  - repo: https://gitcode.com/gh_mirrors/da/darker.git
+    rev: v3.0.0
+    hooks:
+      - id: darker
+        additional_dependencies: ["black==24.10.0", "isort==5.13.2"]
+        args: ["--isort"]
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (local)
+        entry: mypy
+        language: system
+        types: [python]
+        require_serial: true
+        # 双保险：即便某文件路径匹配，也再排除一次 Java 子项目
+        exclude: '^src/datakit_mcp_server/'
