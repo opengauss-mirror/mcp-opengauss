@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import psycopg2
+import re
 import ssl
 from bs4 import BeautifulSoup
 from urllib import request, error
@@ -22,6 +23,208 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("openGauss_mcp_server")
+
+SQL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+VECTOR_DISTANCE_OPERATORS = {
+    "l2": "<->",
+    "cosine": "<=>",
+    "ip": "<#>",
+}
+VECTOR_DISTANCE_OP_CLASSES = {
+    "vector_cosine_ops",
+    "vector_ip_ops",
+    "vector_l1_ops",
+    "vector_l2_ops",
+}
+VECTOR_INDEX_OPTION_RULES = {
+    "hnsw": {
+        "m": (2, 100),
+        "ef_construction": (4, 1000),
+    },
+    "ivfflat": {
+        "lists": (1, 32768),
+    },
+    "diskann": {
+        "index_size": (16, 1000),
+    },
+}
+VECTOR_SEARCH_INTEGER_PARAMETER_RULES = {
+    "hnsw_ef_search": (1, 1000),
+    "nprobes": (1, 32768),
+}
+VECTOR_SEARCH_PARAMETER_GUC_NAMES = {
+    "hnsw_ef_search": "hnsw_ef_search",
+    "nprobes": "ivfflat_probes",
+}
+VECTOR_FILTER_OPERATORS = {
+    "=",
+    "!=",
+    "<>",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "LIKE",
+    "ILIKE",
+    "IN",
+    "IS NULL",
+    "IS NOT NULL",
+}
+VECTOR_FILTER_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "column": {"type": "string"},
+        "operator": {"type": "string"},
+        "value": {},
+    },
+    "required": ["column", "operator"],
+    "additionalProperties": False,
+}
+
+
+def _quote_sql_identifier(identifier: str, *, allow_qualified: bool = False) -> str:
+    """Validate and quote an ASCII SQL identifier."""
+    if not isinstance(identifier, str) or not identifier:
+        raise ValueError("SQL identifier must be a non-empty string")
+
+    identifier_parts = identifier.split(".") if allow_qualified else [identifier]
+    if not allow_qualified and "." in identifier:
+        raise ValueError(f"Invalid SQL identifier: {identifier!r}")
+
+    if not all(SQL_IDENTIFIER_PATTERN.fullmatch(part) for part in identifier_parts):
+        raise ValueError(f"Invalid SQL identifier: {identifier!r}")
+
+    return ".".join(f'"{part}"' for part in identifier_parts)
+
+
+def _validate_integer_range(value: Any, name: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _validate_vector_index_options(index_type: str, options: Optional[dict]) -> dict[str, int]:
+    if options is None:
+        return {}
+    if not isinstance(options, dict):
+        raise ValueError("options must be an object")
+
+    normalized_options: dict[str, Any] = {}
+    for option_name, option_value in options.items():
+        if not isinstance(option_name, str):
+            raise ValueError("Option names must be strings")
+        normalized_option_name = option_name.lower()
+        if normalized_option_name in normalized_options:
+            raise ValueError(
+                f"Duplicate option after case normalization: {normalized_option_name}"
+            )
+        normalized_options[normalized_option_name] = option_value
+
+    option_rules = VECTOR_INDEX_OPTION_RULES[index_type]
+    unsupported_options = set(normalized_options) - set(option_rules)
+    if unsupported_options:
+        unsupported_names = ", ".join(sorted(unsupported_options))
+        raise ValueError(f"Unsupported options for {index_type}: {unsupported_names}")
+
+    validated_options = {}
+    for option_name, option_value in normalized_options.items():
+        minimum, maximum = option_rules[option_name]
+        validated_options[option_name] = _validate_integer_range(
+            option_value,
+            f"options.{option_name}",
+            minimum,
+            maximum,
+        )
+    return validated_options
+
+
+def _build_vector_filter_clause(filters: Optional[list[dict[str, Any]]]) -> tuple[str, list[Any]]:
+    if filters is None:
+        return "", []
+    if not isinstance(filters, list):
+        raise ValueError("other_where_clause must be a list of structured filters")
+
+    clauses = []
+    parameters: list[Any] = []
+    for filter_item in filters:
+        if not isinstance(filter_item, dict):
+            raise ValueError("Raw SQL filters are no longer supported")
+        filter_keys = set(filter_item)
+        required_keys = {"column", "operator"}
+        allowed_keys = required_keys | {"value"}
+        if not required_keys.issubset(filter_keys) or not filter_keys <= allowed_keys:
+            raise ValueError("Each filter must contain column and operator, with optional value")
+
+        quoted_column = _quote_sql_identifier(filter_item["column"])
+        operator_value = filter_item["operator"]
+        if not isinstance(operator_value, str):
+            raise ValueError("Filter operator must be a string")
+        normalized_operator = " ".join(operator_value.upper().split())
+        if normalized_operator not in VECTOR_FILTER_OPERATORS:
+            raise ValueError(f"Unsupported filter operator: {operator_value!r}")
+
+        if normalized_operator in {"IS NULL", "IS NOT NULL"}:
+            filter_value = filter_item.get("value")
+            if filter_value is not None:
+                raise ValueError(f"{normalized_operator} filter value must be null")
+            clauses.append(f"{quoted_column} {normalized_operator}")
+            continue
+
+        if "value" not in filter_item:
+            raise ValueError(f"{normalized_operator} filter requires a value")
+        filter_value = filter_item["value"]
+
+        if normalized_operator == "IN":
+            if not isinstance(filter_value, (list, tuple)) or not filter_value:
+                raise ValueError("IN filter value must be a non-empty list")
+            placeholders = ", ".join("%s" for _ in filter_value)
+            clauses.append(f"{quoted_column} IN ({placeholders})")
+            parameters.extend(filter_value)
+            continue
+
+        clauses.append(f"{quoted_column} {normalized_operator} %s")
+        parameters.append(filter_value)
+
+    if not clauses:
+        return "", []
+    return " WHERE " + " AND ".join(clauses), parameters
+
+
+def _normalize_search_params(search_params: Optional[dict[str, Any]]) -> dict[str, Any]:
+    default_params = {"enable_seqscan": "off", "enable_indexscan": "on"}
+    if search_params is None:
+        return default_params
+    if not isinstance(search_params, dict):
+        raise ValueError("search_params must be an object")
+
+    allowed_keys = set(default_params) | set(VECTOR_SEARCH_INTEGER_PARAMETER_RULES)
+    unsupported_keys = set(search_params) - allowed_keys
+    if unsupported_keys:
+        unsupported_names = ", ".join(sorted(map(str, unsupported_keys)))
+        raise ValueError(f"Unsupported search_params: {unsupported_names}")
+
+    normalized_params: dict[str, Any] = default_params.copy()
+    for parameter_name, parameter_value in search_params.items():
+        if parameter_name in VECTOR_SEARCH_INTEGER_PARAMETER_RULES:
+            minimum, maximum = VECTOR_SEARCH_INTEGER_PARAMETER_RULES[parameter_name]
+            guc_name = VECTOR_SEARCH_PARAMETER_GUC_NAMES[parameter_name]
+            normalized_params[guc_name] = _validate_integer_range(
+                parameter_value,
+                f"search_params.{parameter_name}",
+                minimum,
+                maximum,
+            )
+            continue
+        if isinstance(parameter_value, bool):
+            normalized_params[parameter_name] = "on" if parameter_value else "off"
+            continue
+        if isinstance(parameter_value, str) and parameter_value.lower() in {"on", "off"}:
+            normalized_params[parameter_name] = parameter_value.lower()
+            continue
+        raise ValueError(f"search_params.{parameter_name} must be on, off, or a boolean")
+    return normalized_params
 
 class SecureCredentialCache:
     _instance = None
@@ -218,9 +421,7 @@ async def list_tools() -> list[Tool]:
                     "other_where_clause": {
                         "anyOf": [
                             {
-                                "items": {
-                                    "type": "string"
-                                },
+                                "items": VECTOR_FILTER_INPUT_SCHEMA,
                                 "type": "array"
                             },
                             {
@@ -228,7 +429,8 @@ async def list_tools() -> list[Tool]:
                             }
                         ],
                         "default": None,
-                        "title": "Other Where Clause"
+                        "title": "Other Where Clause",
+                        "description": "Structured filters; non-empty filters are currently rejected until the full-text path is secured"
                     },
                     "limit": {
                         "default": 5,
@@ -320,16 +522,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string"
                     },
                     "filter_expr": {
-                        "anyOf": [
-                            {
-                                "type": "string"
-                            },
-                            {
-                                "type": "null"
-                            }
-                        ],
+                        "type": "null",
                         "default": None,
-                        "title": "Filter Expr"
+                        "title": "Filter Expr",
+                        "description": "Raw SQL filters are disabled for security"
                     },
                     "search_params": {
                         "anyOf": [
@@ -425,11 +621,9 @@ async def list_tools() -> list[Tool]:
                     "other_where_clause": {
                         "title": "Other Where Clause",
                         "type": "array",
-                        "items": {
-                            "type": "string"
-                        },
+                        "items": VECTOR_FILTER_INPUT_SCHEMA,
                         "default": None,
-                        "description": "Additional WHERE clause conditions for filtering results"
+                        "description": "Structured, parameterized filters for vector search results"
                     },
                     "topk": {
                         "title": "Top K",
@@ -503,7 +697,7 @@ def handle_meta_command(cursor, query: str, config: dict) -> list[TextContent]:
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Execute SQL commands."""
     config = get_db_config()
-    logger.info(f"Calling tool: {name} with arguments: {arguments}")
+    logger.info("Calling tool: %s", name)
     
     if name != "execute_sql":
         raise ValueError(f"Unknown tool: {name}")
@@ -540,9 +734,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     conn.commit()
                     return [TextContent(type="text", text=f"Query executed successfully. Rows affected: {cursor.rowcount}")]
                 
-    except Error as e:
-        logger.error(f"Error executing SQL '{query}': {e}")
-        return [TextContent(type="text", text=f"Error executing query: {str(e)}")]
+    except Error as error:
+        logger.error(
+            "SQL execution failed: error_type=%s pgcode=%s",
+            type(error).__name__,
+            getattr(error, "pgcode", None),
+        )
+        return [TextContent(type="text", text="Error executing query")]
 
 @app.tool()
 async def search_opengauss_document(keyword: str):
@@ -776,36 +974,65 @@ async def create_vector_index(
     distance_ops: str = "vector_cosine_ops",
     options: dict | None = None,
 ):
-    """
-    Create a vector index. If the index already exists, drop and recreate it.
-    """
-    index_name = f"{table_name}_{column_name}_vector_idx"
+    """Create a validated vector index, replacing an existing index with the same name."""
+    quoted_table_name = _quote_sql_identifier(table_name, allow_qualified=True)
+    quoted_column_name = _quote_sql_identifier(column_name)
 
-    if options:
-        option_str = ", ".join(f"{k}={v}" for k, v in options.items())
-        with_clause = f"WITH ({option_str})"
-    else:
-        with_clause = ""
+    normalized_index_type = index_type.lower() if isinstance(index_type, str) else ""
+    if normalized_index_type not in VECTOR_INDEX_OPTION_RULES:
+        allowed_index_types = ", ".join(sorted(VECTOR_INDEX_OPTION_RULES))
+        raise ValueError(f"Unsupported index_type. Allowed values are: {allowed_index_types}")
 
-    create_sql = (
-        f"ALTER TABLE {table_name} SET(parallel_workers=32);"
-        f"CREATE INDEX {index_name} "
-        f"ON {table_name} "
-        f"USING {index_type}({column_name} {distance_ops}) "
-        f"{with_clause};"
+    normalized_distance_ops = distance_ops.lower() if isinstance(distance_ops, str) else ""
+    if normalized_distance_ops not in VECTOR_DISTANCE_OP_CLASSES:
+        allowed_distance_ops = ", ".join(sorted(VECTOR_DISTANCE_OP_CLASSES))
+        raise ValueError(f"Unsupported distance_ops. Allowed values are: {allowed_distance_ops}")
+
+    validated_options = _validate_vector_index_options(normalized_index_type, options)
+    table_name_parts = table_name.split(".")
+    table_name_for_index = table_name_parts[-1]
+    index_name = f"{table_name_for_index}_{column_name}_vector_idx"
+    qualified_index_name = (
+        f"{table_name_parts[0]}.{index_name}"
+        if len(table_name_parts) == 2
+        else index_name
+    )
+    quoted_index_name = _quote_sql_identifier(index_name)
+    quoted_drop_index_name = _quote_sql_identifier(
+        qualified_index_name,
+        allow_qualified=True,
+    )
+
+    with_clause = ""
+    if validated_options:
+        option_sql = ", ".join(
+            f"{option_name} = {option_value}"
+            for option_name, option_value in validated_options.items()
+        )
+        with_clause = f" WITH ({option_sql})"
+
+    alter_statement = f"ALTER TABLE {quoted_table_name} SET (parallel_workers = 32)"
+    drop_statement = f"DROP INDEX IF EXISTS {quoted_drop_index_name}"
+    create_statement = (
+        f"CREATE INDEX {quoted_index_name} ON {quoted_table_name} "
+        f"USING {normalized_index_type} "
+        f"({quoted_column_name} {normalized_distance_ops}){with_clause}"
     )
 
     config = get_db_config()
-
     try:
         with connect(**config) as conn:
             with conn.cursor() as cursor:
-                cursor.execute(f"DROP INDEX if exists {index_name};")
-                cursor.execute(create_sql)
-
-    except Error as e:
-        logger.error(f"Database error: {str(e)}")
-        raise RuntimeError(f"Database error: {str(e)}")
+                cursor.execute(alter_statement)
+                cursor.execute(drop_statement)
+                cursor.execute(create_statement)
+    except Error as error:
+        logger.error(
+            "Vector index database operation failed: error_type=%s pgcode=%s",
+            type(error).__name__,
+            getattr(error, "pgcode", None),
+        )
+        raise RuntimeError("Vector index database operation failed") from error
 
     return "create success!"
 
@@ -815,66 +1042,57 @@ async def vector_search(
     vector_data: str,
     vec_column_name: str = "vector",
     distance_func: Optional[str] = "cosine",
-    other_where_clause: Optional[list[str]] = None,
+    other_where_clause: Optional[list[dict[str, Any]]] = None,
     topk: int = 5,
     output_column_name: Optional[list[str]] = None,
 ):
-    """
-    Perform vector similarity search on an OpenGauss table.
+    """Perform a parameterized vector similarity search."""
+    logger.info("Calling tool: vector_search")
 
-    Args:
-        table_name: Name of the table to search.
-        vector_data: Query vector.
-        vec_column_name: column name containing vectors to search.
-        distance_func: The index distance algorithm used when comparing the distance between two vectors.
-        other_where_clause: Other where condition query statements.
-        topk: Number of results returned.
-        output_column_name: Returned table fields.
-    """
-    logger.info(
-        f"Calling tool: opengauss_vector_search with arguments: {table_name}, {vector_data[:10]}, {vec_column_name}"
-    )
-    distance_map = {
-        "l2": "<->",
-        "cosine": "<=>",
-        "ip": "<#>"
-    }
-    key = distance_func.lower() 
-    if key not in distance_map: 
-        raise ValueError(f"Unsupported distance_func '{distance_func}'. " 
-                         f"Allowed values are: {list(distance_map.keys())}")
-    op = distance_map[key]
+    quoted_table_name = _quote_sql_identifier(table_name, allow_qualified=True)
+    quoted_vector_column = _quote_sql_identifier(vec_column_name)
+    if output_column_name is None:
+        select_columns = "*"
+    elif not isinstance(output_column_name, list) or not output_column_name:
+        raise ValueError("output_column_name must be a non-empty list when provided")
+    else:
+        select_columns = ", ".join(
+            _quote_sql_identifier(column_name) for column_name in output_column_name
+        )
 
-    select_cols = ", ".join(output_column_name) if output_column_name else "*"
-    where_sql = ""
-    if other_where_clause:
-        safe_clauses = [clause.strip() for clause in other_where_clause if clause.strip()]
-        if safe_clauses:
-            where_sql = "WHERE " + " AND".join(safe_clauses)
-    
-    sql = (
-        f"set enable_seqscan = off; set enable_indexscan=on;"
-        f"SELECT {select_cols}, {vec_column_name} {op} %s::vector as score "
-        f"FROM {table_name} "
-        f"{where_sql} "
-        f"ORDER BY score "
-        f"LIMIT {topk};"
+    normalized_distance_func = distance_func.lower() if isinstance(distance_func, str) else ""
+    if normalized_distance_func not in VECTOR_DISTANCE_OPERATORS:
+        allowed_values = ", ".join(sorted(VECTOR_DISTANCE_OPERATORS))
+        raise ValueError(
+            f"Unsupported distance_func {distance_func!r}. Allowed values are: {allowed_values}"
+        )
+    distance_operator = VECTOR_DISTANCE_OPERATORS[normalized_distance_func]
+    validated_topk = _validate_integer_range(topk, "topk", 1, 10000)
+    where_clause, filter_parameters = _build_vector_filter_clause(other_where_clause)
+
+    select_statement = (
+        f"SELECT {select_columns}, {quoted_vector_column} {distance_operator} %s::vector AS score "
+        f"FROM {quoted_table_name}{where_clause} ORDER BY score LIMIT %s"
     )
+    query_parameters = [vector_data, *filter_parameters, validated_topk]
 
     config = get_db_config()
-
     try:
         with connect(**config) as conn:
             with conn.cursor() as cursor:
-                cursor.execute(sql, (vector_data,))
+                cursor.execute("SET enable_seqscan = off")
+                cursor.execute("SET enable_indexscan = on")
+                cursor.execute(select_statement, query_parameters)
                 rows = cursor.fetchall()
-                col_names = [desc[0] for desc in cursor.description]
-
-                result = [dict(zip(col_names, row)) for row in rows]
-
-    except Error as e:
-        logger.error(f"Database error: {str(e)}")
-        raise RuntimeError(f"Database error: {str(e)}")
+                column_names = [description[0] for description in cursor.description]
+                result = [dict(zip(column_names, row)) for row in rows]
+    except Error as error:
+        logger.error(
+            "Vector search database operation failed: error_type=%s pgcode=%s",
+            type(error).__name__,
+            getattr(error, "pgcode", None),
+        )
+        raise RuntimeError("Vector search database operation failed") from error
 
     return result
 
@@ -922,7 +1140,7 @@ async def hybrid_search(
     vector_data: str,
     vec_column_name: str = "vector",
     distance_func: str = "cosine",
-    other_where_clause: Optional[list[str]] = None,
+    other_where_clause: Optional[list[dict[str, Any]]] = None,
     limit: int = 5,
     output_column_name: Optional[list[str]] = None,
     text_weight: float = 0.4,
@@ -952,6 +1170,11 @@ async def hybrid_search(
     hybrid_score = (bm25_norm × text_weight) + (vector_norm × vector_weight)
     """
 
+    if other_where_clause:
+        raise ValueError(
+            "Hybrid structured filters are not supported until the full-text path is secured"
+        )
+
     # -----------------------------
     # 1. FULLTEXT SEARCH
     # -----------------------------
@@ -959,7 +1182,7 @@ async def hybrid_search(
         table_name=table_name,
         full_text_search_column_name=full_text_search_column_name,
         keyword=keyword,
-        other_where_clause=other_where_clause,
+        other_where_clause=None,
         limit=1024,  # 取更多用于融合
         output_column_name=output_column_name,
     )
@@ -986,7 +1209,7 @@ async def hybrid_search(
         vector_data=vector_data,
         vec_column_name=vec_column_name,
         distance_func=distance_func,
-        other_where_clause=other_where_clause,
+        other_where_clause=None,
         topk=1024,
         output_column_name=output_column_name,
     )
@@ -1055,84 +1278,105 @@ async def hybrid_search(
 
 @app.tool()
 async def multi_vector_search(
-        table_name: str,
-        vectors: list[list[float]],
-        vector_field: str,
-        limit: int = 5,
-        output_fields: Optional[list[str]] = None,
-        metric_type: str = "cosine",
-        filter_expr: Optional[str] = None,
-        search_params: Optional[dict[str, Any]] = None,
-        parallel_workers: int = 2
+    table_name: str,
+    vectors: list[list[float]],
+    vector_field: str,
+    limit: int = 5,
+    output_fields: Optional[list[str]] = None,
+    metric_type: str = "cosine",
+    filter_expr: Optional[str] = None,
+    search_params: Optional[dict[str, Any]] = None,
+    parallel_workers: int = 2,
 ):
-    """
-    Perform vector similarity search with multiple query vectors.
-    Concurrent processing of multiple vector queries optimizes performance for multi-vector database lookups.
+    """Perform validated vector searches through the openGauss connection pool extension."""
+    quoted_table_name = _quote_sql_identifier(table_name, allow_qualified=True)
+    quoted_vector_field = _quote_sql_identifier(vector_field)
+    if output_fields is None:
+        select_columns = "*"
+    elif not isinstance(output_fields, list) or not output_fields:
+        raise ValueError("output_fields must be a non-empty list when provided")
+    else:
+        select_columns = ", ".join(
+            _quote_sql_identifier(field_name) for field_name in output_fields
+        )
 
-    Args:
-        table_name: Name of collection to search
-        vectors: List of query vectors
-        vector_field: Field containing vectors to search
-        limit: Maximum number of results per query
-        output_fields: Fields to return in results
-        metric_type: Distance metric (COSINE, L2, IP)
-        filter_expr: Optional filter expression
-        search_params: Additional search parameters
-        parallel_workers: Number of threads in the database concurrent connection pool
-    """
+    normalized_metric_type = metric_type.lower() if isinstance(metric_type, str) else ""
+    if normalized_metric_type not in VECTOR_DISTANCE_OPERATORS:
+        allowed_values = ", ".join(sorted(VECTOR_DISTANCE_OPERATORS))
+        raise ValueError(
+            f"Unsupported metric_type {metric_type!r}. Allowed values are: {allowed_values}"
+        )
+    metric_operator = VECTOR_DISTANCE_OPERATORS[normalized_metric_type]
+    validated_limit = _validate_integer_range(limit, "limit", 1, 10000)
+    validated_parallel_workers = _validate_integer_range(
+        parallel_workers,
+        "parallel_workers",
+        1,
+        64,
+    )
+    if filter_expr is not None:
+        raise ValueError("Raw SQL filters are no longer supported")
+    normalized_search_params = _normalize_search_params(search_params)
+
+    if not isinstance(vectors, list) or not vectors:
+        raise ValueError("vectors must be a non-empty list")
+    for vector in vectors:
+        if not isinstance(vector, list) or not vector:
+            raise ValueError("Each vector must be a non-empty list")
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in vector):
+            raise ValueError("Vector values must be numbers")
+
     try:
-        from psycopg2.extras import execute_multi_search, init_conn_pool, close_conn_pool
-    except Exception as e:
+        from psycopg2.extras import close_conn_pool, execute_multi_search, init_conn_pool
+    except ImportError as error:
         raise ImportError(
-            "The current psycopg2 installation does not include the openGauss-specific "
-            "extensions 'execute_multi_search', 'init_conn_pool', or 'close_conn_pool'.\n\n"
-            "Please download the openGauss‑compatible psycopg package from the official documentation:\n"
-            "https://docs.opengauss.org/zh/docs/latest/datavec/integration_python.html\n\n"
-            f"Original error: {e}"
-        )
+            "The current psycopg2 installation does not include the required openGauss "
+            "multi-search extensions"
+        ) from error
 
+    sql_template = (
+        f"SELECT {select_columns}, {quoted_vector_field} {metric_operator} %s::vector AS score "
+        f"FROM {quoted_table_name} ORDER BY score LIMIT {validated_limit}"
+    )
+    argument_list = [(f"[{', '.join(str(value) for value in vector)}]",) for vector in vectors]
+    config = get_db_config()
+    connection_pool = None
+
+    operation_error: Optional[Exception] = None
     try:
-        distance_map = {
-            "l2": "<->",
-            "cosine": "<=>",
-            "ip": "<#>"
-        }
-        key = metric_type.lower() 
-        if key not in distance_map: 
-            raise ValueError(f"Unsupported distance_func '{metric_type}'. " 
-                             f"Allowed values are: {list(distance_map.keys())}")
-        metric_op = distance_map[key]
-
-        if search_params is None:
-            search_params = {"enable_seqscan": "off", "enable_indexscan": "on"}
-        
-        config = get_db_config()
-
-        select_cols = ", ".join(output_fields) if output_fields else "*"
-
-        where_sql = ""
-        if filter_expr:
-            safe_clauses = [clause.strip() for clause in filter_expr if clause.strip()]
-            if safe_clauses:
-                where_sql = "WHERE " + " AND".join(safe_clauses)
-
-        sql_template = (
-            f"SELECT {select_cols}, {vector_field} {metric_op} %s::vector as score "
-            f"FROM {table_name} "
-            f"{where_sql} "
-            f"ORDER BY score "
-            f"LIMIT {limit};"
+        connection_pool = init_conn_pool(
+            config,
+            validated_parallel_workers,
+            normalized_search_params,
         )
-
-        arglist = [(f"[{', '.join(str(x) for x in v)}]",) for v in vectors]
-
-        conn_pool_mgr = init_conn_pool(config, parallel_workers, search_params)
-        res = execute_multi_search(config, conn_pool_mgr, sql_template, arglist, search_params, parallel_workers)
-        close_conn_pool(conn_pool_mgr)
-
-        return {"result" : res}
-    except Exception as e:
-        raise ValueError(f"Multi-vector search failed: {str(e)}")
+        result = execute_multi_search(
+            config,
+            connection_pool,
+            sql_template,
+            argument_list,
+            normalized_search_params,
+            validated_parallel_workers,
+        )
+        return {"result": result}
+    except Exception as error:
+        operation_error = error
+        raise ValueError(
+            f"Multi-vector search failed with {type(error).__name__}"
+        ) from error
+    finally:
+        if connection_pool is not None:
+            try:
+                close_conn_pool(connection_pool)
+            except Exception as close_error:
+                if operation_error is None:
+                    raise ValueError(
+                        f"Multi-vector search pool close failed with {type(close_error).__name__}"
+                    ) from close_error
+                logger.error(
+                    "Multi-vector search pool close failed after operation error: "
+                    "error_type=%s",
+                    type(close_error).__name__,
+                )
 
 ENABLE_MEMORY = int(os.getenv("ENABLE_MEMORY", 0))
 EMBEDDING_MODEL_PROVIDER = os.getenv("EMBEDDING_MODEL_PROVIDER", "huggingface")
@@ -1856,11 +2100,9 @@ if ENABLE_MEMORY:
 
 async def main():
     """Main entry point to run the MCP server."""
-    from mcp.server.stdio import stdio_server
-    
     logger.info("Starting openGauss MCP server...")
-    config = get_db_config()
-    logger.info(f"Database config: {config['host']}/{config['dbname']} as {config['user']}")
+    get_db_config()
+    logger.info("Database configuration loaded")
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
