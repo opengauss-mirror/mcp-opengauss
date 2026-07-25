@@ -326,7 +326,6 @@ async def list_resources() -> list[Resource]:
 @app.tool()
 async def read_resource(uri: AnyUrl) -> str:
     """Read table contents."""
-    config = get_db_config()
     uri_str = str(uri)
     logger.info(f"Reading resource: {uri_str}")
     
@@ -334,7 +333,8 @@ async def read_resource(uri: AnyUrl) -> str:
         raise ValueError(f"Invalid URI scheme: {uri_str}")
         
     parts = uri_str[12:].split('/')
-    table = parts[0]
+    table = _quote_sql_identifier(parts[0], allow_qualified=True)
+    config = get_db_config()
     
     try:
         with connect(**config) as conn:
@@ -345,9 +345,9 @@ async def read_resource(uri: AnyUrl) -> str:
                 result = [",".join(map(str, row)) for row in rows]
                 return "\n".join([",".join(columns)] + result)
                 
-    except Error as e:
-        logger.error(f"Database error reading resource {uri}: {str(e)}")
-        raise RuntimeError(f"Database error: {str(e)}")
+    except Error:
+        logger.exception("Database error while reading resource")
+        raise RuntimeError("Database operation failed") from None
 
 @app.tool()
 async def list_tools() -> list[Tool]:
@@ -868,7 +868,10 @@ def ensure_bm25_index(cursor, table_name: str, column_name: str):
     """
     Ensure BM25 index exists; create it if missing.
     """
-    index_name = f"bm25_{table_name}_{column_name}"
+    quoted_table_name = _quote_sql_identifier(table_name, allow_qualified=True)
+    quoted_column_name = _quote_sql_identifier(column_name)
+    index_name = f"bm25_{table_name.replace('.', '_')}_{column_name}"
+    quoted_index_name = _quote_sql_identifier(index_name)
 
     cursor.execute(
         "SELECT indexname FROM pg_indexes WHERE indexname = %s;",
@@ -883,7 +886,8 @@ def ensure_bm25_index(cursor, table_name: str, column_name: str):
     # create index
     logger.info(f"BM25 index {index_name} not found, creating...")
     cursor.execute(
-        f"CREATE INDEX {index_name} ON {table_name} USING bm25({column_name});"
+        f"CREATE INDEX {quoted_index_name} ON {quoted_table_name} "
+        f"USING bm25({quoted_column_name});"
     )
 
     # check
@@ -920,7 +924,7 @@ async def fulltext_search(
     table_name: str,
     full_text_search_column_name: list[str],
     keyword: str,
-    other_where_clause: Optional[list[str]] = None,
+    other_where_clause: Optional[list[dict[str, Any]]] = None,
     limit: int = 5,
     output_column_name: Optional[list[str]] = None,
 ):
@@ -928,31 +932,30 @@ async def fulltext_search(
     Search for documents using full text search in a OpenGauss table.
     Automatically creates bm25 index if missing.
     """
-    config = get_db_config()
     main_search_column = full_text_search_column_name[0]
+
+    quoted_table_name = _quote_sql_identifier(table_name, allow_qualified=True)
+    quoted_search_column = _quote_sql_identifier(main_search_column)
+    if output_column_name:
+        select_columns = ", ".join(
+            _quote_sql_identifier(column_name) for column_name in output_column_name
+        )
+    else:
+        select_columns = "*"
+    where_clause, filter_parameters = _build_vector_filter_clause(other_where_clause)
+    query = (
+        "set enable_seqscan = off; set enable_indexscan = on;"
+        f"SELECT {select_columns}, {quoted_search_column} <&> %s as score "
+        f"FROM {quoted_table_name}{where_clause} "
+        f"ORDER BY {quoted_search_column} <&> %s desc limit %s"
+    )
+    params = [keyword, *filter_parameters, keyword, limit]
+    config = get_db_config()
 
     try:
         with connect(**config) as conn:
             with conn.cursor() as cursor:
                 ensure_bm25_index(cursor, table_name, main_search_column)
-
-                select_columns = ", ".join(output_column_name) if output_column_name else "*"
-                query = f"""
-                set enable_seqscan = off;
-                set enable_indexscan = on;
-                select {select_columns},
-                       {main_search_column} <&> %s as score
-                from {table_name}
-                where 1=1
-                """
-
-                if other_where_clause:
-                    for condition in other_where_clause:
-                        query += f" AND {condition}"
-
-                query += f" order by {main_search_column} <&> %s desc limit %s"
-                params = [keyword, keyword, limit]
-
                 cursor.execute(query, params)
 
                 columns = [desc[0] for desc in cursor.description]
@@ -962,9 +965,9 @@ async def fulltext_search(
 
                 return result
 
-    except Error as e:
-        logger.error(f"Error executing SQL : {e}")
-        return f"Error executing query: {str(e)}"
+    except Error:
+        logger.exception("Full-text search database operation failed")
+        return "Error executing query"
 
 @app.tool()
 async def create_vector_index(
