@@ -97,6 +97,93 @@ def _quote_sql_identifier(identifier: str, *, allow_qualified: bool = False) -> 
     return ".".join(f'"{part}"' for part in identifier_parts)
 
 
+def _split_table_identifier(table_name: str) -> tuple[Optional[str], str]:
+    """Return (schema, table) for a simple or schema-qualified table name."""
+    _quote_sql_identifier(table_name, allow_qualified=True)
+    if not isinstance(table_name, str) or not table_name:
+        raise ValueError("table_name must be a non-empty string")
+    parts = table_name.split(".")
+    if len(parts) == 1:
+        return None, parts[0]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    raise ValueError(f"Invalid SQL identifier: {table_name!r}")
+
+
+def _discover_unique_key_columns(table_name: str) -> list[str]:
+    """Find a non-null primary key or unique constraint for a table.
+
+    Primary keys are preferred.  A unique constraint is accepted only when all
+    of its columns are declared NOT NULL, so NULL values cannot produce an
+    ambiguous merge key.
+    """
+    schema_name, relation_name = _split_table_identifier(table_name)
+    query = """
+        SELECT tc.constraint_type, tc.constraint_name,
+               kcu.ordinal_position, kcu.column_name, c.is_nullable
+          FROM information_schema.table_constraints AS tc
+          JOIN information_schema.key_column_usage AS kcu
+            ON tc.constraint_schema = kcu.constraint_schema
+           AND tc.constraint_name = kcu.constraint_name
+           AND tc.table_name = kcu.table_name
+          JOIN information_schema.columns AS c
+            ON c.table_schema = kcu.table_schema
+           AND c.table_name = kcu.table_name
+           AND c.column_name = kcu.column_name
+         WHERE tc.table_schema = COALESCE(%s, current_schema())
+           AND tc.table_name = %s
+           AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')
+         ORDER BY CASE WHEN tc.constraint_type = 'PRIMARY KEY' THEN 0 ELSE 1 END,
+                  tc.constraint_name, kcu.ordinal_position
+    """
+    config = get_db_config()
+    try:
+        with connect(**config) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (schema_name, relation_name))
+                rows = cursor.fetchall()
+    except Error as error:
+        logger.error(
+            "Could not discover a stable key: error_type=%s", type(error).__name__
+        )
+        raise RuntimeError(
+            f"Could not inspect table {table_name!r} for a primary or unique key"
+        ) from error
+
+    candidates: dict[tuple[str, str], list[tuple[int, str, str]]] = {}
+    for constraint_type, constraint_name, ordinal, column_name, is_nullable in rows:
+        candidate = (constraint_type, constraint_name)
+        candidates.setdefault(candidate, []).append(
+            (ordinal, column_name, is_nullable)
+        )
+    for (constraint_type, _), columns in candidates.items():
+        if all(is_nullable == "NO" for _, _, is_nullable in columns):
+            return [column_name for _, column_name, _ in sorted(columns)]
+    raise ValueError(
+        f"Table {table_name!r} has no non-null primary key or unique key; "
+        "specify unique_key_columns explicitly or add a suitable constraint"
+    )
+
+
+def _normalize_unique_key_columns(
+    unique_key_columns: Optional[list[str]],
+) -> Optional[list[str]]:
+    if unique_key_columns is None:
+        return None
+    if not isinstance(unique_key_columns, list) or not unique_key_columns:
+        raise ValueError("unique_key_columns must be a non-empty list when provided")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for column_name in unique_key_columns:
+        _quote_sql_identifier(column_name)
+        normalized_name = column_name.lower()
+        if normalized_name in seen:
+            raise ValueError(f"Duplicate unique key column: {column_name!r}")
+        seen.add(normalized_name)
+        normalized.append(column_name)
+    return normalized
+
+
 def _validate_integer_range(value: Any, name: str, minimum: int, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer")
@@ -385,7 +472,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="hybrid_search",
-            description="Hybrid search combining BM25 full-text search, vector similarity search, and scalar filtering. Performs weighted fusion of text and vector search results for more accurate and comprehensive search results. Steps: 1) Full-text search with BM25 scoring, 2) Vector similarity search, 3) Weighted fusion and ranking. Note: hybrid_score, vector_norm, bm25_norm are computed fields, not database columns.",
+            description="Hybrid search combining BM25 full-text search, vector similarity search, and scalar filtering. Performs weighted fusion of text and vector search results for more accurate and comprehensive search results. Steps: 1) Full-text search with BM25 scoring, 2) Vector similarity search, 3) Weighted fusion and ranking. Stable fusion keys are auto-detected from the table primary/unique key; unique_key_columns can override this. Note: hybrid_score, vector_norm, bm25_norm are computed fields, not database columns.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -451,6 +538,15 @@ async def list_tools() -> list[Tool]:
                         ],
                         "default": None,
                         "title": "Output Column Name"
+                    },
+                    "unique_key_columns": {
+                        "anyOf": [
+                            {"items": {"type": "string"}, "minItems": 1, "type": "array"},
+                            {"type": "null"}
+                        ],
+                        "default": None,
+                        "title": "Unique Key Columns",
+                        "description": "Optional stable key columns for result fusion; auto-detected from the table primary/unique key when omitted"
                     },
                     "text_weight": {
                         "default": 0.4,
@@ -1148,6 +1244,7 @@ async def hybrid_search(
     output_column_name: Optional[list[str]] = None,
     text_weight: float = 0.4,
     vector_weight: float = 0.6,
+    unique_key_columns: Optional[list[str]] = None,
 ):
     """
     Hybrid search: Fusion query combining BM25 full-text search, 
@@ -1171,12 +1268,40 @@ async def hybrid_search(
     
     Fusion Formula:
     hybrid_score = (bm25_norm × text_weight) + (vector_norm × vector_weight)
+
+    `unique_key_columns` may be supplied for non-standard keys or composite
+    keys. When omitted, the table primary key or a non-null unique constraint
+    is discovered automatically.
     """
 
     if other_where_clause:
         raise ValueError(
             "Hybrid structured filters are not supported until the full-text path is secured"
         )
+
+    # The two component searches run independently and must be joined on a
+    # stable database key.  Prefer an explicitly supplied key; otherwise
+    # discover a non-null primary/unique key from the table metadata.
+    if output_column_name is None:
+        search_output_columns = None  # SELECT * includes the discovered key.
+    elif not isinstance(output_column_name, list) or not output_column_name:
+        raise ValueError("output_column_name must be a non-empty list when provided")
+    else:
+        if any(
+            not isinstance(column, str) or not column
+            for column in output_column_name
+        ):
+            raise ValueError("output_column_name must contain non-empty strings")
+        search_output_columns = list(output_column_name)
+
+    normalized_key_columns = _normalize_unique_key_columns(unique_key_columns)
+    if normalized_key_columns is None:
+        normalized_key_columns = _discover_unique_key_columns(table_name)
+    if search_output_columns is not None:
+        existing_columns = {column.lower() for column in search_output_columns}
+        for key_column in normalized_key_columns:
+            if key_column.lower() not in existing_columns:
+                search_output_columns.append(key_column)
 
     # -----------------------------
     # 1. FULLTEXT SEARCH
@@ -1187,8 +1312,10 @@ async def hybrid_search(
         keyword=keyword,
         other_where_clause=None,
         limit=1024,  # 取更多用于融合
-        output_column_name=output_column_name,
+        output_column_name=search_output_columns,
     )
+    if not isinstance(bm25_results, list):
+        raise RuntimeError("Full-text search did not return a result list")
 
     # 提取 BM25 分数
     bm25_scores = [item["score"] for item in bm25_results] if bm25_results else []
@@ -1214,15 +1341,21 @@ async def hybrid_search(
         distance_func=distance_func,
         other_where_clause=None,
         topk=1024,
-        output_column_name=output_column_name,
+        output_column_name=search_output_columns,
     )
+    if not isinstance(vector_results, list):
+        raise RuntimeError("Vector search did not return a result list")
 
     # 向量距离越小越相似 → 转成相似度(距离越小分数越大)
     vector_scores = [item["score"] for item in vector_results]
 
     vector_norm = normalize_vector_scores(
         vector_scores,
-        distance_type=distance_func
+        distance_type=(
+            distance_func.lower()
+            if isinstance(distance_func, str)
+            else distance_func
+        )
     )
 
     for item, norm in zip(vector_results, vector_norm):
@@ -1233,16 +1366,34 @@ async def hybrid_search(
     # -----------------------------
     merged = {}
 
+    def result_id(item: dict) -> object:
+        values = []
+        for key_column in normalized_key_columns:
+            value = item.get(key_column)
+            if value is None and key_column not in item:
+                case_insensitive_key = next(
+                    (key for key in item if isinstance(key, str) and key.lower() == key_column.lower()),
+                    None,
+                )
+                value = item.get(case_insensitive_key) if case_insensitive_key else None
+            if value is None:
+                raise ValueError(
+                    "hybrid_search result is missing a non-null unique key value: "
+                    + ", ".join(normalized_key_columns)
+                )
+            values.append(value)
+        return values[0] if len(values) == 1 else tuple(values)
+
     #merge bm25 results
     for item in bm25_results:
-        rid = item.get("id") or item.get("uuid") or id(item)
+        rid = result_id(item)
         merged[rid] = item
         merged[rid]["bm25_norm"] = item.get("bm25_norm", 0)
         merged[rid]["vector_norm"] = 0
 
     #merge vector results
     for item in vector_results:
-        rid = item.get("id") or item.get("uuid") or id(item)
+        rid = result_id(item)
         if rid not in merged:
             merged[rid] = item
             merged[rid]["bm25_norm"] = 0

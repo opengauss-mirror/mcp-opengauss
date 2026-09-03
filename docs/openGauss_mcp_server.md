@@ -192,6 +192,10 @@ test_vectors_5d,test2,public
 
 问题二：混合搜索（全文+向量+标量）<br>
 对表格test_vectors_5d进行混合搜索，要求全文搜索的权重是0.7，返回参数不需要返回向量列
+
+混合搜索会自动从表的主键或非空唯一约束中发现结果融合所需的稳定记录键。
+如果表没有可发现的唯一键，可以显式传入 `unique_key_columns`，例如
+`["memory_id"]` 或 `["tenant_id", "document_id"]`；指定的键会自动加入内部查询列。
 ```json
 {
   "id": 1,
