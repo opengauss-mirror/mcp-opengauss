@@ -177,11 +177,83 @@ async def test_hybrid_search(mock_db_connection):
             full_text_search_column_name=["col1"],
             keyword="test",
             vector_data="[0.1,0.2]",
+            output_column_name=["id", "content"],
             text_weight=0.5,
-            vector_weight=0.5
+            vector_weight=0.5,
+            unique_key_columns=["id"],
         )
         assert len(result) == 3 
         assert result[0]["hybrid_score"] == 0.975
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_auto_adds_explicit_unique_key_column():
+    bm25_mock = AsyncMock(return_value=[{"memory_id": 1, "content": "test", "score": 0.8}])
+    vector_mock = AsyncMock(return_value=[{"memory_id": 1, "content": "test", "score": 0.1}])
+    with patch("openGauss_mcp_server.server.fulltext_search", bm25_mock), patch(
+        "openGauss_mcp_server.server.vector_search", vector_mock
+    ):
+        result = await hybrid_search(
+            table_name="table1",
+            full_text_search_column_name=["content"],
+            keyword="test",
+            vector_data="[0.1,0.2]",
+            output_column_name=["content"],
+            unique_key_columns=["memory_id"],
+        )
+    assert len(result) == 1
+    assert bm25_mock.await_args.kwargs["output_column_name"] == ["content", "memory_id"]
+    assert vector_mock.await_args.kwargs["output_column_name"] == ["content", "memory_id"]
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_auto_discovers_primary_key(mock_db_connection):
+    _, mock_cursor = mock_db_connection
+    mock_cursor.fetchall.return_value = [
+        ("PRIMARY KEY", "documents_pkey", 1, "memory_id", "NO"),
+    ]
+    bm25_mock = AsyncMock(return_value=[{"memory_id": 1, "score": 0.8}])
+    vector_mock = AsyncMock(return_value=[{"memory_id": 1, "score": 0.1}])
+    with patch("openGauss_mcp_server.server.fulltext_search", bm25_mock), patch(
+        "openGauss_mcp_server.server.vector_search", vector_mock
+    ):
+        result = await hybrid_search(
+            table_name="documents",
+            full_text_search_column_name=["content"],
+            keyword="test",
+            vector_data="[0.1,0.2]",
+            output_column_name=["content"],
+        )
+    assert len(result) == 1
+    assert bm25_mock.await_args.kwargs["output_column_name"] == ["content", "memory_id"]
+    assert vector_mock.await_args.kwargs["output_column_name"] == ["content", "memory_id"]
+
+
+def test_discover_unique_key_columns_supports_composite_primary_key(mock_db_connection):
+    _, mock_cursor = mock_db_connection
+    mock_cursor.fetchall.return_value = [
+        ("PRIMARY KEY", "documents_pkey", 1, "tenant_id", "NO"),
+        ("PRIMARY KEY", "documents_pkey", 2, "document_id", "NO"),
+    ]
+    assert server_module._discover_unique_key_columns("documents") == [
+        "tenant_id",
+        "document_id",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_requires_discoverable_unique_key():
+    with patch(
+        "openGauss_mcp_server.server._discover_unique_key_columns",
+        side_effect=ValueError("no non-null primary key"),
+    ), pytest.raises(ValueError, match="no non-null primary key"):
+        await hybrid_search(
+            table_name="table1",
+            full_text_search_column_name=["content"],
+            keyword="test",
+            vector_data="[0.1,0.2]",
+            output_column_name=["content"],
+        )
 
 
 @pytest.mark.asyncio
